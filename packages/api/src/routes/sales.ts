@@ -48,9 +48,9 @@ export async function commitSaleHandler(req: Request) {
 
   try {
     const result = await prisma.$transaction(async (tx) => {
-      // Idempotency guard
+      // Idempotency guard (scoped by business via unique constraint)
       const existing = await tx.idempotencyRecord.findUnique({
-        where: { key: data.idempotencyKey },
+        where: { businessId_key: { businessId: data.tenantId, key: data.idempotencyKey } },
       });
       if (existing) {
         throw new Error("DUPLICATE_IDEMPOTENCY_KEY");
@@ -84,6 +84,29 @@ export async function commitSaleHandler(req: Request) {
       const paidCentavos = data.payments.reduce((sum, p) => sum + p.amountCentavos, 0);
       if (paidCentavos < totalCentavos) {
         throw new Error("PAYMENT_INSUFFICIENT");
+      }
+
+      // Stock invariants: check and lock per tracked product
+      const products = await tx.product.findMany({
+        where: { id: { in: [...new Set(data.items.map((i) => i.productId))] } },
+        select: { id: true, trackInventory: true, allowNegative: true },
+      });
+      const prodMap = new Map(products.map((p) => [p.id, p]));
+
+      for (const it of data.items) {
+        const prod = prodMap.get(it.productId);
+        if (!prod) throw new Error("PRODUCT_NOT_FOUND");
+        if (!prod.trackInventory) continue;
+
+        const bal = await tx.inventoryBalance.findUnique({
+          where: { productId_branchId: { productId: it.productId, branchId: data.branchId } },
+        });
+        if (!bal) {
+          throw new Error("INVENTORY_BALANCE_MISSING");
+        }
+        if (bal.quantity < it.qty && !prod.allowNegative) {
+          throw new Error("INSUFFICIENT_STOCK");
+        }
       }
 
       // Create sale
@@ -122,9 +145,12 @@ export async function commitSaleHandler(req: Request) {
         },
       });
 
-      // Inventory movements and balance updates
+      // Inventory movements and balance updates (after sale creation)
       for (const it of data.items) {
-        const move = await tx.inventoryMovement.create({
+        const prod = prodMap.get(it.productId)!;
+        if (!prod.trackInventory) continue;
+
+        await tx.inventoryMovement.create({
           data: {
             id: crypto.randomUUID(),
             businessId: shift.businessId,
@@ -137,16 +163,9 @@ export async function commitSaleHandler(req: Request) {
           },
         });
 
-        await tx.inventoryBalance.upsert({
+        await tx.inventoryBalance.update({
           where: { productId_branchId: { productId: it.productId, branchId: data.branchId } },
-          update: { quantity: { decrement: it.qty } },
-          create: {
-            id: crypto.randomUUID(),
-            businessId: shift.businessId,
-            branchId: data.branchId,
-            productId: it.productId,
-            quantity: -it.qty,
-          },
+          data: { quantity: { decrement: it.qty } },
         });
       }
 
@@ -171,7 +190,7 @@ export async function commitSaleHandler(req: Request) {
   } catch (err: any) {
     const code = err?.message || "UNKNOWN";
     return new Response(JSON.stringify({ error: code }), {
-      status: code.includes("DUPLICATE") ? 409 : code.includes("SHIFT") || code.includes("PAYMENT") ? 400 : 500,
+      status: code.includes("DUPLICATE") ? 409 : code.includes("SHIFT") || code.includes("PAYMENT") || code.includes("STOCK") || code.includes("INVENTORY") ? 400 : 500,
       headers: { "content-type": "application/json" },
     });
   }
