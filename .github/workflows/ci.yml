@@ -38,8 +38,23 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm db:migrate:deploy
       - run: pnpm --filter @online-pos/database generate
+      - run: pnpm db:seed
       - run: pnpm --filter @online-pos/domain test
       - run: pnpm --filter @online-pos/api build
       - run: pnpm --filter @online-pos/web build
       - run: pnpm exec playwright install --with-deps chromium
+      - name: Start application services
+        run: |
+          pnpm --filter @online-pos/api start > /tmp/online-pos-api.log 2>&1 &
+          pnpm --filter @online-pos/web start > /tmp/online-pos-web.log 2>&1 &
+          for attempt in {1..30}; do
+            if curl --fail --silent http://localhost:3001/api/v1/ready >/dev/null &&
+              curl --fail --silent http://localhost:3000/ >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          cat /tmp/online-pos-api.log
+          cat /tmp/online-pos-web.log
+          exit 1
       - run: pnpm test:e2e
