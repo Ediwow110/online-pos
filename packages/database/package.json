@@ -7,6 +7,7 @@
   "scripts": {
     "generate": "prisma generate",
     "migrate:dev": "prisma migrate dev",
+    "migrate:deploy": "prisma migrate deploy",
     "reset": "prisma migrate reset --force",
     "seed": "tsx prisma/seed.ts",
     "build": "prisma generate"
@@ -16,6 +17,7 @@
     "bcryptjs": "^2.4.3"
   },
   "devDependencies": {
+    "@types/node": "^22.15.0",
     "@types/bcryptjs": "^2.4.6",
     "prisma": "^6.16.2",
     "tsx": "^4.19.2",

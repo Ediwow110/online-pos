@@ -12,3 +12,7 @@ coverage
 apps/api/dist
 apps/web/.next
 packages/database/generated
+
+# Playwright artifacts
+playwright-report
+test-results

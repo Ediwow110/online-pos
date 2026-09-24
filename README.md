@@ -28,6 +28,7 @@ pnpm dev
 
 - Web: http://localhost:3000
 - API: http://localhost:3001/api/v1/health
+- Readiness: http://localhost:3001/api/v1/ready
 
 ### Demo login
 
@@ -62,6 +63,28 @@ Invariants:
 - Sale, payment, inventory, and cash effects commit in one transaction.
 - Duplicate sale/payment commands reuse an idempotency key.
 - Unknown payments are queryable. The UI never asks for a blind retry.
+
+### Production checks
+
+Use committed migrations for deployment environments:
+
+```bash
+DATABASE_URL="$DATABASE_URL" pnpm db:migrate:deploy
+pnpm --filter @online-pos/database generate
+```
+
+`/api/v1/health` reports process health. `/api/v1/ready` also verifies the PostgreSQL connection and returns `503` when the database is unavailable. Configure `DATABASE_URL`, `WEB_ORIGIN`, `SESSION_SECRET`, `COOKIE_SECURE`, and any provider webhook secrets through the deployment environment; never commit them.
+
+### Browser tests
+
+Run the critical-path Playwright suite against the running web and API services:
+
+```bash
+pnpm exec playwright install chromium
+pnpm test:e2e
+```
+
+CI installs Chromium's system dependencies automatically. Minimal containers may require administrator access to install GTK/ATK runtime libraries locally.
 
 ## Repo layout
 

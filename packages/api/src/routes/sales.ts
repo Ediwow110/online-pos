@@ -1,4 +1,5 @@
 import { PrismaClient } from "@online-pos/database";
+import { randomUUID } from "node:crypto";
 import {
   roundHalfUp,
   pesosToCentavos,
@@ -9,6 +10,11 @@ import {
 import { z } from "zod";
 
 const prisma = new PrismaClient();
+
+export type SaleActorContext = {
+  userId: string;
+  businessId: string;
+};
 
 const saleItemSchema = z.object({
   productId: z.string(),
@@ -34,7 +40,7 @@ const saleCommitSchema = z.object({
   idempotencyKey: z.string().max(128),
 });
 
-export async function commitSaleHandler(req: Request) {
+export async function commitSaleHandler(req: Request, actor?: SaleActorContext) {
   const body = await req.json().catch(() => null);
   const parse = saleCommitSchema.safeParse(body);
   if (!parse.success) {
@@ -47,13 +53,29 @@ export async function commitSaleHandler(req: Request) {
   const data = parse.data;
 
   try {
+    if (!actor) {
+      return new Response(JSON.stringify({ error: "UNAUTHENTICATED" }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (data.tenantId !== actor.businessId) {
+      return new Response(JSON.stringify({ error: "BUSINESS_SCOPE_MISMATCH" }), {
+        status: 403,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
     const result = await prisma.$transaction(async (tx) => {
       // Idempotency guard (scoped by business via unique constraint)
-      const existing = await tx.idempotencyRecord.findUnique({
-        where: { businessId_key: { businessId: data.tenantId, key: data.idempotencyKey } },
+      const existing = await tx.idempotencyRecord.findFirst({
+        where: { businessId: data.tenantId, key: data.idempotencyKey, commandType: "SALE_COMMIT" },
       });
       if (existing) {
-        throw new Error("DUPLICATE_IDEMPOTENCY_KEY");
+        if (existing.requestHash !== JSON.stringify(data)) {
+          throw new Error("IDEMPOTENCY_KEY_REUSED");
+        }
+        return { replay: true, saleId: existing.resourceId };
       }
 
       // Shift invariant
@@ -61,8 +83,26 @@ export async function commitSaleHandler(req: Request) {
         where: { id: data.shiftId },
         include: { register: true },
       });
-      if (!shift || shift.status !== "OPEN" || shift.registerId !== data.registerId || shift.branchId !== data.branchId) {
+      if (
+        !shift ||
+        shift.businessId !== actor.businessId ||
+        shift.status !== "OPEN" ||
+        shift.registerId !== data.registerId ||
+        shift.register.branchId !== data.branchId
+      ) {
         throw new Error("SHIFT_NOT_OPEN_OR_MISMATCH");
+      }
+      const subscription = await tx.subscription.findUnique({ where: { businessId: actor.businessId } });
+      if (subscription && (subscription.status === "CANCELLED" || subscription.status === "PAST_DUE")) {
+        throw new Error("SUBSCRIPTION_INACTIVE");
+      }
+      if (subscription) {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${actor.businessId}))::text`;
+        const periodStart = new Date();
+        periodStart.setDate(1);
+        periodStart.setHours(0, 0, 0, 0);
+        const orderCount = await tx.sale.count({ where: { businessId: actor.businessId, createdAt: { gte: periodStart }, status: { not: "VOIDED" } } });
+        if (orderCount >= subscription.monthlyOrderLimit) throw new Error("MONTHLY_ORDER_LIMIT_REACHED");
       }
 
       // Compute totals
@@ -88,12 +128,16 @@ export async function commitSaleHandler(req: Request) {
 
       // Stock invariants: check and lock per tracked product
       const products = await tx.product.findMany({
-        where: { id: { in: [...new Set(data.items.map((i) => i.productId))] } },
-        select: { id: true, trackInventory: true, allowNegative: true },
+        where: { businessId: actor.businessId, id: { in: [...new Set(data.items.map((i) => i.productId))] } },
+        select: { id: true, name: true, sku: true, trackInventory: true, allowNegative: true },
       });
       const prodMap = new Map(products.map((p) => [p.id, p]));
+      if (data.customerId) {
+        const customer = await tx.customer.findFirst({ where: { id: data.customerId, businessId: actor.businessId } });
+        if (!customer) throw new Error("CUSTOMER_NOT_FOUND");
+      }
 
-      for (const it of data.items) {
+      for (const [index, it] of data.items.entries()) {
         const prod = prodMap.get(it.productId);
         if (!prod) throw new Error("PRODUCT_NOT_FOUND");
         if (!prod.trackInventory) continue;
@@ -110,56 +154,73 @@ export async function commitSaleHandler(req: Request) {
       }
 
       // Create sale
+      const receiptNumber = `SALE-${Date.now()}-${Math.floor(Math.random() * 1000).toString().padStart(3, "0")}`;
+      const cashierId = actor.userId;
+      const saleItemIds = data.items.map(() => randomUUID());
       const sale = await tx.sale.create({
         data: {
-          id: crypto.randomUUID(),
-          branchId: data.branchId,
+          id: randomUUID(),
           businessId: shift.businessId,
           registerId: data.registerId,
           shiftId: data.shiftId,
+          cashierId,
+          receiptNumber,
           customerId: data.customerId ?? null,
           status: "COMPLETED",
-          subtotalCentavos,
-          discountCentavos,
-          vatCentavos,
-          totalCentavos,
-          paidCentavos,
-          changeCentavos: paidCentavos - totalCentavos,
+          subtotal: subtotalCentavos,
+          lineDiscount: discountCentavos,
+          orderDiscount: 0,
+          tax: vatCentavos,
+          total: totalCentavos,
+          paid: paidCentavos,
+          changeDue: paidCentavos - totalCentavos,
+          taxInclusive: false,
+          taxRateBps: vatBps,
+          completedAt: new Date(),
           items: {
-            create: data.items.map((it) => ({
-              id: crypto.randomUUID(),
+            create: data.items.map((it, index) => ({
+              id: saleItemIds[index],
+              businessId: shift.businessId,
               productId: it.productId,
-              variantId: it.variantId ?? null,
-              qty: it.qty,
-              unitPriceCentavos: it.unitPriceCentavos,
-              discountCentavos: it.lineDiscountCentavos ?? 0,
+              nameSnapshot: prodMap.get(it.productId)?.name ?? "Product",
+              skuSnapshot: prodMap.get(it.productId)?.sku ?? "",
+              quantity: it.qty,
+              unitPrice: it.unitPriceCentavos,
+              unitCost: 0,
+              lineDiscount: it.lineDiscountCentavos ?? 0,
+              taxRateBps: vatBps,
+              lineTotal: it.unitPriceCentavos * it.qty - (it.lineDiscountCentavos ?? 0),
             })),
           },
           payments: {
             create: data.payments.map((p) => ({
-              id: crypto.randomUUID(),
+              id: randomUUID(),
+              businessId: shift.businessId,
               method: p.method,
-              amountCentavos: p.amountCentavos,
+              amount: p.amountCentavos,
+              status: "COMPLETED",
+              actorId: cashierId,
+              idempotencyKey: data.idempotencyKey,
             })),
           },
         },
       });
 
       // Inventory movements and balance updates (after sale creation)
-      for (const it of data.items) {
+      for (const [index, it] of data.items.entries()) {
         const prod = prodMap.get(it.productId)!;
         if (!prod.trackInventory) continue;
 
         await tx.inventoryMovement.create({
           data: {
-            id: crypto.randomUUID(),
+            id: randomUUID(),
             businessId: shift.businessId,
             branchId: data.branchId,
             productId: it.productId,
-            shiftId: data.shiftId,
-            saleId: sale.id,
             type: "SALE",
             quantity: -it.qty,
+            actorId: cashierId,
+            saleItemId: saleItemIds[index],
           },
         });
 
@@ -169,28 +230,57 @@ export async function commitSaleHandler(req: Request) {
         });
       }
 
+      const cashAmount = data.payments
+        .filter((payment) => payment.method === "CASH")
+        .reduce((sum, payment) => sum + payment.amountCentavos, 0);
+      if (cashAmount > 0) {
+        await tx.cashMovement.create({
+          data: {
+            businessId: shift.businessId,
+            shiftId: shift.id,
+            type: "CASH_SALE",
+            amount: Math.min(cashAmount, totalCentavos),
+            saleId: sale.id,
+            actorId: cashierId,
+            reason: `Sale ${sale.receiptNumber}`,
+          },
+        });
+      }
+
       // Idempotency record
       await tx.idempotencyRecord.create({
         data: {
-          id: crypto.randomUUID(),
+          id: randomUUID(),
           key: data.idempotencyKey,
           businessId: shift.businessId,
-          lastStatus: "COMPLETED",
-          lastResponse: { saleId: sale.id },
+          commandType: "SALE_COMMIT",
+          requestHash: JSON.stringify(data),
+          responseJson: { saleId: sale.id },
+          resourceId: sale.id,
         },
       });
 
-      return sale;
+      await tx.auditLog.create({
+        data: {
+          businessId: shift.businessId,
+          actorId: cashierId,
+          action: "SALE_COMMITTED",
+          entityType: "Sale",
+          entityId: sale.id,
+          reason: `Receipt ${sale.receiptNumber}`,
+        },
+      });
+      return { replay: false, saleId: sale.id };
     });
 
-    return new Response(JSON.stringify({ ok: true, saleId: result.id }), {
-      status: 201,
+    return new Response(JSON.stringify({ ok: true, saleId: result.saleId, ...(result.replay ? { replayed: true } : {}) }), {
+      status: result.replay ? 200 : 201,
       headers: { "content-type": "application/json" },
     });
   } catch (err: any) {
     const code = err?.message || "UNKNOWN";
     return new Response(JSON.stringify({ error: code }), {
-      status: code.includes("DUPLICATE") ? 409 : code.includes("SHIFT") || code.includes("PAYMENT") || code.includes("STOCK") || code.includes("INVENTORY") ? 400 : 500,
+      status: code.includes("DUPLICATE") || code.includes("IDEMPOTENCY") ? 409 : code.includes("SHIFT") || code.includes("PAYMENT") || code.includes("STOCK") || code.includes("INVENTORY") || code.includes("SUBSCRIPTION") || code.includes("CUSTOMER") || code.includes("PRODUCT") || code.includes("LIMIT") ? 400 : 500,
       headers: { "content-type": "application/json" },
     });
   }
