@@ -3,7 +3,7 @@ import { expect, test } from "@playwright/test";
 test("landing page exposes the primary store workflow", async ({ page }) => {
   await page.goto("/");
   await expect(page).toHaveTitle(/Ledgerly/);
-  await expect(page.getByRole("link", { name: /open your store/i })).toBeVisible();
+  await expect(page.getByRole("link", { name: /start for free/i })).toBeVisible();
 });
 
 test("unauthenticated users are redirected from protected routes", async ({ page }) => {
