@@ -8,7 +8,9 @@ test("landing page exposes the primary store workflow", async ({ page }) => {
 
 test("unauthenticated users are redirected from protected routes", async ({ page }) => {
   await page.goto("/pos");
-  await expect(page).toHaveURL(/\/login\?next=%2Fpos/);
+  // Middleware builds the redirect via URLSearchParams; browsers may render
+  // the slash either raw ("/pos") or encoded ("%2Fpos"). Accept both.
+  await expect(page).toHaveURL(/\/login\?next=(%2F|\/)pos/);
   await expect(page.getByRole("heading", { name: /sign in to your store/i })).toBeVisible();
 });
 
