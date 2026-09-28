@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const protectedPaths = ["/dashboard", "/pos", "/inventory", "/sales", "/customers", "/receipt", "/branches", "/billing", "/transfers"];
+const protectedPaths = ["/dashboard", "/pos", "/products", "/inventory", "/sales", "/customers", "/receipt", "/branches", "/billing", "/transfers"];
 
 export function middleware(request: NextRequest) {
   if (protectedPaths.some((path) => request.nextUrl.pathname === path || request.nextUrl.pathname.startsWith(`${path}/`))) {
@@ -13,4 +13,4 @@ export function middleware(request: NextRequest) {
   return NextResponse.next();
 }
 
-export const config = { matcher: ["/dashboard/:path*", "/pos/:path*", "/inventory/:path*", "/sales/:path*", "/customers/:path*", "/receipt/:path*", "/branches/:path*", "/billing/:path*", "/transfers/:path*"] };
+export const config = { matcher: ["/dashboard/:path*", "/pos/:path*", "/products/:path*", "/inventory/:path*", "/sales/:path*", "/customers/:path*", "/receipt/:path*", "/branches/:path*", "/billing/:path*", "/transfers/:path*"] };
