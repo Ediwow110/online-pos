@@ -23,10 +23,13 @@ test("owner can sign in and reach the management dashboard", async ({ page }) =>
 
 test("owner can inspect branches, transfers, and billing pages", async ({ page }) => {
   await page.goto("/login");
+  await page.getByLabel("Email").fill(process.env.TEST_EMAIL ?? "owner@valdez.store");
+  await page.getByLabel("Password").fill(process.env.TEST_PASSWORD ?? "ChangeMe123!");
   await page.getByRole("button", { name: /sign in/i }).click();
   await expect(page).toHaveURL(/\/dashboard$/);
-  for (const path of ["/branches", "/transfers", "/billing"]) {
+  for (const path of ["/products", "/branches", "/transfers", "/billing"]) {
     await page.goto(path);
     await expect(page).not.toHaveURL(/\/login/);
+    await expect(page.getByRole("main")).toBeVisible();
   }
 });
