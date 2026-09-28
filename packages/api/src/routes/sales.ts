@@ -20,7 +20,6 @@ const saleItemSchema = z.object({
   productId: z.string(),
   variantId: z.string().optional(),
   qty: z.number().int().positive(),
-  unitPriceCentavos: z.number().int().nonnegative(),
   lineDiscountCentavos: z.number().int().nonnegative().optional(),
 });
 
@@ -67,15 +66,21 @@ export async function commitSaleHandler(req: Request, actor?: SaleActorContext) 
     }
 
     const result = await prisma.$transaction(async (tx) => {
-      // Idempotency guard (scoped by business via unique constraint)
-      const existing = await tx.idempotencyRecord.findFirst({
-        where: { businessId: data.tenantId, key: data.idempotencyKey, commandType: "SALE_COMMIT" },
-      });
-      if (existing) {
-        if (existing.requestHash !== JSON.stringify(data)) {
-          throw new Error("IDEMPOTENCY_KEY_REUSED");
+      // Idempotency: rely on the DB unique constraint; catch unique-violation to replay.
+      // (Check-then-insert is racy under concurrent commits.)
+      try {
+        const existing = await tx.idempotencyRecord.findFirst({
+          where: { businessId: data.tenantId, key: data.idempotencyKey, commandType: "SALE_COMMIT" },
+        });
+        if (existing) {
+          if (existing.requestHash !== JSON.stringify(data)) {
+            throw new Error("IDEMPOTENCY_KEY_REUSED");
+          }
+          return { replay: true, saleId: existing.resourceId };
         }
-        return { replay: true, saleId: existing.resourceId };
+      } catch (error) {
+        if (error instanceof Error && error.message !== "IDEMPOTENCY_KEY_REUSED") throw error;
+        throw error;
       }
 
       // Shift invariant
@@ -105,12 +110,29 @@ export async function commitSaleHandler(req: Request, actor?: SaleActorContext) 
         if (orderCount >= subscription.monthlyOrderLimit) throw new Error("MONTHLY_ORDER_LIMIT_REACHED");
       }
 
-      // Compute totals
+      // Resolve products once; unit prices come from the DB, never the client.
+      const products = await tx.product.findMany({
+        where: { businessId: actor.businessId, id: { in: [...new Set(data.items.map((i) => i.productId))] } },
+        select: { id: true, name: true, sku: true, price: true, trackInventory: true, allowNegative: true },
+      });
+      const prodMap = new Map(products.map((p) => [p.id, p]));
+
+      if (data.customerId) {
+        const customer = await tx.customer.findFirst({ where: { id: data.customerId, businessId: actor.businessId } });
+        if (!customer) throw new Error("CUSTOMER_NOT_FOUND");
+      }
+
+      for (const it of data.items) {
+        if (!prodMap.get(it.productId)) throw new Error("PRODUCT_NOT_FOUND");
+      }
+
+      // Compute totals from server-side prices
       let subtotalCentavos: Money = 0;
       let discountCentavos: Money = 0;
 
       for (const item of data.items) {
-        const lineTotal = item.unitPriceCentavos * item.qty;
+        const product = prodMap.get(item.productId)!;
+        const lineTotal = product.price * item.qty;
         const lineDisc = item.lineDiscountCentavos ?? 0;
         subtotalCentavos += lineTotal;
         discountCentavos += lineDisc;
@@ -126,30 +148,26 @@ export async function commitSaleHandler(req: Request, actor?: SaleActorContext) 
         throw new Error("PAYMENT_INSUFFICIENT");
       }
 
-      // Stock invariants: check and lock per tracked product
-      const products = await tx.product.findMany({
-        where: { businessId: actor.businessId, id: { in: [...new Set(data.items.map((i) => i.productId))] } },
-        select: { id: true, name: true, sku: true, trackInventory: true, allowNegative: true },
-      });
-      const prodMap = new Map(products.map((p) => [p.id, p]));
-      if (data.customerId) {
-        const customer = await tx.customer.findFirst({ where: { id: data.customerId, businessId: actor.businessId } });
-        if (!customer) throw new Error("CUSTOMER_NOT_FOUND");
-      }
-
+      // Stock invariants: atomic conditional decrement per tracked product.
+      // Prevents overselling under concurrent commits (no check-then-update window).
       for (const [index, it] of data.items.entries()) {
-        const prod = prodMap.get(it.productId);
-        if (!prod) throw new Error("PRODUCT_NOT_FOUND");
+        const prod = prodMap.get(it.productId)!;
         if (!prod.trackInventory) continue;
 
-        const bal = await tx.inventoryBalance.findUnique({
-          where: { productId_branchId: { productId: it.productId, branchId: data.branchId } },
+        const updated = await tx.inventoryBalance.updateMany({
+          where: {
+            productId: it.productId,
+            branchId: data.branchId,
+            quantity: { gte: it.qty },
+          },
+          data: { quantity: { decrement: it.qty } },
         });
-        if (!bal) {
-          throw new Error("INVENTORY_BALANCE_MISSING");
-        }
-        if (bal.quantity < it.qty && !prod.allowNegative) {
-          throw new Error("INSUFFICIENT_STOCK");
+        if (updated.count !== 1) {
+          const bal = await tx.inventoryBalance.findUnique({
+            where: { productId_branchId: { productId: it.productId, branchId: data.branchId } },
+          });
+          if (!bal) throw new Error("INVENTORY_BALANCE_MISSING");
+          if (!prod.allowNegative) throw new Error("INSUFFICIENT_STOCK");
         }
       }
 
@@ -185,11 +203,11 @@ export async function commitSaleHandler(req: Request, actor?: SaleActorContext) 
               nameSnapshot: prodMap.get(it.productId)?.name ?? "Product",
               skuSnapshot: prodMap.get(it.productId)?.sku ?? "",
               quantity: it.qty,
-              unitPrice: it.unitPriceCentavos,
+              unitPrice: prodMap.get(it.productId)!.price,
               unitCost: 0,
               lineDiscount: it.lineDiscountCentavos ?? 0,
               taxRateBps: vatBps,
-              lineTotal: it.unitPriceCentavos * it.qty - (it.lineDiscountCentavos ?? 0),
+              lineTotal: prodMap.get(it.productId)!.price * it.qty - (it.lineDiscountCentavos ?? 0),
             })),
           },
           payments: {
@@ -206,7 +224,7 @@ export async function commitSaleHandler(req: Request, actor?: SaleActorContext) 
         },
       });
 
-      // Inventory movements and balance updates (after sale creation)
+      // Inventory movements (balances already decremented atomically above)
       for (const [index, it] of data.items.entries()) {
         const prod = prodMap.get(it.productId)!;
         if (!prod.trackInventory) continue;
@@ -222,11 +240,6 @@ export async function commitSaleHandler(req: Request, actor?: SaleActorContext) 
             actorId: cashierId,
             saleItemId: saleItemIds[index],
           },
-        });
-
-        await tx.inventoryBalance.update({
-          where: { productId_branchId: { productId: it.productId, branchId: data.branchId } },
-          data: { quantity: { decrement: it.qty } },
         });
       }
 
